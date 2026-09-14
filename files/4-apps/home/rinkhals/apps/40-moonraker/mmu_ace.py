@@ -620,6 +620,14 @@ class MmuAceController:
         self._gate_lookup_cache: OrderedDict = OrderedDict()
         self._max_gate_cache_size = 16  # Match temp cache size
 
+        # Manually-assigned Spoolman database IDs (key: global gate index,
+        # value: spool_id), set via MMU_SET_SPOOL or a non-RFID MMU_GATE_MAP
+        # update. RFID-tagged gates otherwise have gate.spool_id permanently
+        # overwritten by the RFID-serial-derived pseudo-ID on every hardware
+        # status poll (see _set_ace_status) — this override survives that
+        # resync. See issue #141.
+        self._manual_spool_overrides: Dict[int, int] = {}
+
         if host is None:
             self.printer = KlippyPrinterController(self.server)
         else:
@@ -1219,16 +1227,25 @@ class MmuAceController:
 
                 # Parse SKU for additional information
                 gate.sku = sku
+                # A manually-assigned Spoolman ID (via MMU_SET_SPOOL, or a
+                # non-RFID MMU_GATE_MAP update) takes priority over the
+                # RFID-serial-derived pseudo-ID below: that pseudo-ID is not a
+                # real Spoolman database ID, so it must never clobber a real
+                # one on this periodic resync. See issue #141.
+                override_spool_id = self._manual_spool_overrides.get(global_gate_index)
                 if sku:
                     sku_info = parse_anycubic_sku(sku)
                     gate.vendor = sku_info["vendor"]
                     gate.series = sku_info["series"]
                     gate.color_name = sku_info["color_name"]
-                    # Use serial number as spool_id if available
-                    try:
-                        gate.spool_id = int(sku_info["serial"]) if sku_info["serial"] else abs(hash(sku)) % (2**31)
-                    except:
-                        gate.spool_id = abs(hash(sku)) % (2**31)
+                    if override_spool_id is not None:
+                        gate.spool_id = override_spool_id
+                    else:
+                        # Use serial number as spool_id if available
+                        try:
+                            gate.spool_id = int(sku_info["serial"]) if sku_info["serial"] else abs(hash(sku)) % (2**31)
+                        except:
+                            gate.spool_id = abs(hash(sku)) % (2**31)
 
                     # Update filament_name with full description if parsed
                     if sku_info["vendor"] and sku_info["series"]:
@@ -1237,7 +1254,7 @@ class MmuAceController:
                             parts.append(sku_info["color_name"])
                         gate.filament_name = " ".join(parts)
                 else:
-                    gate.spool_id = 0
+                    gate.spool_id = override_spool_id if override_spool_id is not None else 0
 
                 unit.gates.append(gate)
 
@@ -1513,6 +1530,14 @@ class MmuAceController:
         if color is None:
             color = [0, 0, 0, 0]
 
+        # Record a manually-assigned Spoolman ID *before* the RFID-lock check
+        # below, so it survives even when the rest of this update is (correctly)
+        # rejected for an RFID-tagged gate. The Spoolman ID is independent of
+        # the RFID payload (material/color/temp), so there's no reason it
+        # should be locked out with everything else. See issue #141.
+        if spool_id is not None and spool_id > 0:
+            self._manual_spool_overrides[gate_index] = spool_id
+
         if gate.rfid == 2:
             logging.warning(f"update gate {gate_index} not allowed, RFID tag is locked")
             return
@@ -1553,6 +1578,29 @@ class MmuAceController:
         self._handle_status_update(force=True)
         logging.debug(f"updated gate {gate_index}: {material} {filament_name}")
 
+    def set_manual_spool_id(self, gate_index: int, spool_id: int) -> bool:
+        """Manually assign a Spoolman database ID to a gate.
+
+        Unlike update_gate(), this does not touch material/color/temperature
+        and is allowed even when the gate is RFID-locked (gate.rfid == 2):
+        the Spoolman ID has nothing to do with the RFID payload. The value is
+        also remembered in _manual_spool_overrides so the periodic RFID
+        resync in _set_ace_status() doesn't clobber it with the
+        RFID-serial-derived pseudo-ID on the next hardware poll. See issue #141.
+        """
+        gate_lookup = self._get_gate_by_index(gate_index)
+        if not gate_lookup:
+            logging.warning(f"set_manual_spool_id: gate {gate_index} not found")
+            return False
+
+        _, gate = gate_lookup
+        self._manual_spool_overrides[gate_index] = spool_id
+        gate.spool_id = spool_id
+
+        self._handle_status_update(force=True)
+        logging.info(f"Gate {gate_index}: manual Spoolman ID set to {spool_id}")
+        return True
+
 class MmuAcePatcher:
 
     ace: MmuAce
@@ -1592,6 +1640,7 @@ class MmuAcePatcher:
 
         # gcode handlers
         self.register_gcode_handler("MMU_GATE_MAP", self._on_gcode_mmu_gate_map)
+        self.register_gcode_handler("MMU_SET_SPOOL", self._on_gcode_mmu_set_spool)
         self.register_gcode_handler("MMU_TTG_MAP", self._on_gcode_mmu_ttg_map)
         self.register_gcode_handler("MMU_ENDLESS_SPOOL", self._on_gcode_mmu_endless_spool)
         self.register_gcode_handler("MMU_SELECT", self._on_gcode_mmu_select)
@@ -1762,6 +1811,34 @@ class MmuAcePatcher:
         except Exception as e:
             logging.error(f"Failed to send gcode response: {e}")
 
+    async def _activate_spoolman_for_gate(self, gate_index: int):
+        """Set Moonraker's native [spoolman] component's active spool to match
+        gate_index's gate_spool_id, if any.
+
+        Called on every successful MMU_LOAD so Spoolman's active-spool (and
+        therefore its usage tracking) follows in-print color changes, not
+        just the spool that was loaded at print start. Deliberately
+        best-effort: a missing/unconfigured spoolman component, or a gate
+        with no assigned Spoolman ID yet, are not errors here. See issue #141.
+        """
+        gate_lookup = self.ace_controller._get_gate_by_index(gate_index)
+        if not gate_lookup:
+            return
+
+        _, gate = gate_lookup
+        if not gate.spool_id or gate.spool_id <= 0:
+            return
+
+        try:
+            spoolman = self.server.lookup_component("spoolman", None)
+            if spoolman is None:
+                logging.debug("_activate_spoolman_for_gate: spoolman component not loaded, skipping")
+                return
+            await spoolman.set_active_spool(gate.spool_id)
+            logging.info(f"Activated Spoolman spool {gate.spool_id} for gate {gate_index}")
+        except Exception as e:
+            logging.warning(f"_activate_spoolman_for_gate: failed to set active spool for gate {gate_index}: {e}")
+
     async def _ensure_extruder_temp(self, gate: int, min_temp: int = 170) -> bool:
         """Ensure extruder is heated to proper temperature for filament operations.
 
@@ -1917,6 +1994,13 @@ class MmuAcePatcher:
             self.ace.loaded_gate = gate  # Track which gate is physically loaded
             self.ace.filament.pos = FILAMENT_POS_LOADED
             self.ace_controller._handle_status_update(force=True)
+
+            # Switch Moonraker's native [spoolman] component's active spool to
+            # match the gate that was just loaded, so per-gate Spoolman usage
+            # tracking follows every in-print color change, not just the
+            # spool loaded at print start. Best-effort: a missing/misconfigured
+            # spoolman component or an unset gate_spool_id must not fail the load.
+            await self._activate_spoolman_for_gate(gate)
 
             message = f"MMU_LOAD: Loading {length}mm from gate {gate} (index {local_index}) at {speed}mm/s completed, MMU status updated"
             logging.info(message)
@@ -2288,6 +2372,41 @@ class MmuAcePatcher:
                 spool_id = value["spool_id"],
                 speed_override = value["speed_override"],
             )
+
+    async def _on_gcode_mmu_set_spool(self, args: dict[str, str | None], delegate):
+        """Manually assign a Spoolman ID to a gate: MMU_SET_SPOOL GATE=<n> SPOOLID=<id>
+
+        Flat-argument alternative to MMU_GATE_MAP MAP={...}: the dict-literal
+        MAP= value cannot currently survive kobra.py's shlex.split()-based
+        gcode argument parser intact (quotes get stripped, or the string gets
+        split apart on an unquoted space), so MMU_GATE_MAP cannot be used to
+        set a Spoolman ID from Mainsail's "Choose Spool" button. This command
+        takes two plain key=value arguments instead, which shlex.split()
+        tokenizes correctly.
+
+        Also works on RFID-tagged gates, where update_gate() otherwise
+        rejects all writes: the Spoolman ID is independent of the RFID
+        payload, so locking it out made real Spoolman integration impossible
+        for genuine Anycubic spools. See issue #141.
+        """
+        gate_index = self._get_gcode_arg_int("GATE", args)
+        spool_id = self._get_gcode_arg_int("SPOOLID", args)
+
+        if spool_id <= 0:
+            message = f"MMU_SET_SPOOL: SPOOLID must be a positive integer, got {spool_id}"
+            logging.error(message)
+            await self._send_gcode_response(message)
+            return None
+
+        if self.ace_controller.set_manual_spool_id(gate_index, spool_id):
+            message = f"MMU_SET_SPOOL: Gate {gate_index} assigned Spoolman ID {spool_id}"
+            logging.info(message)
+        else:
+            message = f"MMU_SET_SPOOL: Gate {gate_index} not found"
+            logging.error(message)
+
+        await self._send_gcode_response(message)
+        return None
 
     async def _on_gcode_dryer_start(self, args: dict[str, str | None], delegate):
         """Start dryer: MMU_DRYER_START UNIT=0 DURATION=120 [TEMP=45] [FAN_SPEED=0]

@@ -7,6 +7,7 @@ import argparse
 import filecmp
 import json
 import ast
+import inspect
 import logging
 import os
 import re
@@ -1819,7 +1820,13 @@ class MmuAcePatcher:
         therefore its usage tracking) follows in-print color changes, not
         just the spool that was loaded at print start. Deliberately
         best-effort: a missing/unconfigured spoolman component, or a gate
-        with no assigned Spoolman ID yet, are not errors here. See issue #141.
+        with no assigned Spoolman ID yet, are not errors here.
+
+        set_active_spool()'s result is only awaited if it's actually
+        awaitable: we don't have this device's spoolman.py in this repo to
+        confirm it always matches upstream Moonraker's async signature, so
+        this defensively supports either a coroutine or a plain return value
+        rather than assuming one. See issue #141.
         """
         gate_lookup = self.ace_controller._get_gate_by_index(gate_index)
         if not gate_lookup:
@@ -1834,7 +1841,9 @@ class MmuAcePatcher:
             if spoolman is None:
                 logging.debug("_activate_spoolman_for_gate: spoolman component not loaded, skipping")
                 return
-            await spoolman.set_active_spool(gate.spool_id)
+            result = spoolman.set_active_spool(gate.spool_id)
+            if inspect.isawaitable(result):
+                await result
             logging.info(f"Activated Spoolman spool {gate.spool_id} for gate {gate_index}")
         except Exception as e:
             logging.warning(f"_activate_spoolman_for_gate: failed to set active spool for gate {gate_index}: {e}")
@@ -2389,8 +2398,18 @@ class MmuAcePatcher:
         payload, so locking it out made real Spoolman integration impossible
         for genuine Anycubic spools. See issue #141.
         """
-        gate_index = self._get_gcode_arg_int("GATE", args)
-        spool_id = self._get_gcode_arg_int("SPOOLID", args)
+        try:
+            gate_index = self._get_gcode_arg_int("GATE", args)
+            spool_id = self._get_gcode_arg_int("SPOOLID", args)
+        except ValueError as e:
+            # _get_gcode_arg_int raises (rather than returning None) when GATE
+            # or SPOOLID is missing or non-numeric, so this is the only place
+            # that error is actually reachable — catch it here and turn it
+            # into a normal gcode_response instead of an unhandled exception.
+            message = f"MMU_SET_SPOOL: {e}"
+            logging.error(message)
+            await self._send_gcode_response(message)
+            return None
 
         if spool_id <= 0:
             message = f"MMU_SET_SPOOL: SPOOLID must be a positive integer, got {spool_id}"
